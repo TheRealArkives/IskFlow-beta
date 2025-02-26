@@ -1,0 +1,321 @@
+import requests
+import pandas as pd
+import sqlite3
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import tkinter as tk
+from tkinter import ttk, messagebox
+import threading
+import queue
+import os
+import csv
+
+# Base de données SQLite pour cache
+DB_FILE = "eve_market_cache.db"
+TYPES_FILE = "invTypes.csv"
+FUZZWORK_URL = "https://www.fuzzwork.co.uk/dump/latest/invTypes.csv"
+
+# File d'attente pour le multithreading
+data_queue = queue.Queue()
+
+# Télécharger la base de Fuzzwork si elle n'existe pas
+def download_fuzzwork_types():
+    if not os.path.exists(TYPES_FILE):
+        print("Téléchargement de la base invTypes depuis Fuzzwork...")
+        response = requests.get(FUZZWORK_URL, stream=True)
+        response.raise_for_status()
+        with open(TYPES_FILE, 'wb') as f:
+            f.write(response.content)
+        print("Téléchargement terminé !")
+    else:
+        print("Base invTypes déjà présente localement.")
+
+# Charger les items depuis le fichier CSV
+def load_items():
+    items = {}  # typeID -> typeName
+    name_to_id = {}  # typeName -> typeID
+    with open(TYPES_FILE, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            type_id = int(row['typeID'])
+            type_name = row['typeName']
+            # On filtre les items publiés uniquement (published = 1)
+            if int(row['published']) == 1:
+                items[type_id] = type_name
+                name_to_id[type_name] = type_id
+    return items, name_to_id
+
+# Récupération des données ESI
+def fetch_market_data(type_id, region_id, thread_id):
+    url = f"https://esi.evetech.net/latest/markets/{region_id}/history/?datasource=tranquility&type_id={type_id}"
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        conn = sqlite3.connect(DB_FILE)
+        df = pd.DataFrame(data)
+        df['type_id'] = type_id
+        df['region_id'] = region_id
+        df.to_sql("market_data", conn, if_exists="replace", index=False)
+        conn.close()
+        data_queue.put((thread_id, data))
+    except Exception as e:
+        data_queue.put((thread_id, f"Erreur : {e}"))
+
+def fetch_order_book(type_id, region_id, thread_id):
+    url = f"https://esi.evetech.net/latest/markets/{region_id}/orders/?datasource=tranquility&order_type=all&type_id={type_id}"
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        conn = sqlite3.connect(DB_FILE)
+        df = pd.DataFrame(data)
+        df['type_id'] = type_id
+        df['region_id'] = region_id
+        df.to_sql("order_book", conn, if_exists="replace", index=False)
+        conn.close()
+        data_queue.put((thread_id, data))
+    except Exception as e:
+        data_queue.put((thread_id, f"Erreur : {e}"))
+
+# Calculs des indicateurs
+def calculate_tema(series, period):
+    ema1 = series.ewm(span=period, adjust=False).mean()
+    ema2 = ema1.ewm(span=period, adjust=False).mean()
+    ema3 = ema2.ewm(span=period, adjust=False).mean()
+    return 3 * ema1 - 3 * ema2 + ema3
+
+def calculate_rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def calculate_atr(df, length, smoothing):
+    tr = df['highest'] - df['lowest']
+    if smoothing == "RMA":
+        atr = tr.ewm(alpha=1/length, adjust=False).mean()
+    elif smoothing == "SMA":
+        atr = tr.rolling(window=length).mean()
+    elif smoothing == "EMA":
+        atr = tr.ewm(span=length, adjust=False).mean()
+    else:  # WMA
+        atr = tr.rolling(window=length).apply(lambda x: pd.Series(x).mul(range(1, length+1)).sum() / ((length * (length + 1)) / 2))
+    return atr
+
+def process_data(data, timeframe, indicators, atr_params):
+    if not data:
+        return None
+    df = pd.DataFrame(data)
+    df['date'] = pd.to_datetime(df['date'])
+    df = df[['date', 'average', 'highest', 'lowest', 'volume']].sort_values('date')
+    
+    if timeframe == "Weekly":
+        df = df.resample('W', on='date').agg({'average': 'mean', 'highest': 'max', 'lowest': 'min', 'volume': 'sum'}).reset_index()
+    
+    for ind, per in indicators.items():
+        if ind == "MA":
+            df[f'MA{per}'] = df['average'].rolling(window=per).mean()
+        elif ind == "EMA":
+            df[f'EMA{per}'] = df['average'].ewm(span=per, adjust=False).mean()
+        elif ind == "TEMA":
+            df[f'TEMA{per}'] = calculate_tema(df['average'], per)
+        elif ind == "RSI":
+            df[f'RSI{per}'] = calculate_rsi(df['average'], per)
+    
+    if atr_params:
+        length, smoothing, multiplier = atr_params
+        df['ATR'] = calculate_atr(df, length, smoothing)
+        df['Short_SL'] = df['highest'] + df['ATR'] * multiplier
+        df['Long_SL'] = df['lowest'] - df['ATR'] * multiplier
+    
+    return df
+
+# Graphique et tableau
+def plot_chart(df, order_book, type_id, region_id, timeframe, indicators, atr_params, log_scale, root, items):
+    chart_window = tk.Toplevel(root)
+    chart_window.title(f"{items.get(int(type_id), 'Item ' + str(type_id))} - {REGIONS[region_id]} ({timeframe})")
+    
+    main_frame = ttk.Frame(chart_window)
+    main_frame.pack(fill=tk.BOTH, expand=1)
+    
+    fig = plt.Figure(figsize=(12, 4))
+    ax1 = fig.add_subplot(111)
+    ax2 = ax1.twinx()
+    
+    ax1.plot(df['date'], df['average'], label='Prix moyen', color='blue')
+    ax2.bar(df['date'], df['volume'], label='Volume', color='gray', alpha=0.3)
+    
+    colors = ['orange', 'green', 'red', 'purple', 'cyan']
+    for i, (ind, per) in enumerate(indicators.items()):
+        if ind in ["MA", "EMA", "TEMA"]:
+            ax1.plot(df['date'], df[f'{ind}{per}'], label=f'{ind} {per}', color=colors[i % len(colors)])
+    
+    if atr_params:
+        ax1.plot(df['date'], df['Short_SL'], label='Short Stop Loss', color='red', linestyle='--')
+        ax1.plot(df['date'], df['Long_SL'], label='Long Stop Loss', color='teal', linestyle='--')
+    
+    ax1.set_yscale('log' if log_scale else 'linear')
+    ax1.legend(loc='upper left')
+    ax2.legend(loc='upper right')
+    ax1.grid()
+    fig.tight_layout()
+    
+    canvas = FigureCanvasTkAgg(fig, master=main_frame)
+    canvas.draw()
+    canvas.get_tk_widget().pack(fill=tk.BOTH, expand=1)
+
+    if order_book:
+        orders_df = pd.DataFrame(order_book)
+        buy_orders = orders_df[orders_df['is_buy_order'] == True].sort_values('price', ascending=False)
+        sell_orders = orders_df[orders_df['is_buy_order'] == False].sort_values('price')
+        
+        buy_grouped = buy_orders.groupby('price')['volume_remain'].sum().reset_index()
+        sell_grouped = sell_orders.groupby('price')['volume_remain'].sum().reset_index()
+        
+        order_frame = ttk.Frame(main_frame)
+        order_frame.pack(fill=tk.BOTH, expand=1)
+        
+        ttk.Label(order_frame, text="Volume Achat").grid(row=0, column=0, padx=5, pady=5)
+        ttk.Label(order_frame, text="Prix").grid(row=0, column=1, padx=5, pady=5)
+        ttk.Label(order_frame, text="Volume Vente").grid(row=0, column=2, padx=5, pady=5)
+        
+        max_rows = min(10, max(len(buy_grouped), len(sell_grouped)))
+        
+        for i in range(max_rows):
+            if i < len(buy_grouped):
+                ttk.Label(order_frame, text=f"{buy_grouped['volume_remain'].iloc[i]:,}", 
+                         foreground='green').grid(row=i+1, column=0, padx=5, pady=2)
+                ttk.Label(order_frame, text=f"{buy_grouped['price'].iloc[i]:,.2f}", 
+                         foreground='green').grid(row=i+1, column=1, padx=5, pady=2)
+            
+            if i < len(sell_grouped):
+                ttk.Label(order_frame, text=f"{sell_grouped['volume_remain'].iloc[i]:,}", 
+                         foreground='red').grid(row=i+1, column=2, padx=5, pady=2)
+                if i == 0:
+                    ttk.Label(order_frame, text=f"{sell_grouped['price'].iloc[i]:,.2f}", 
+                            foreground='red').grid(row=i+1, column=1, padx=5, pady=2)
+
+# Interface Tkinter
+root = tk.Tk()
+root.title("EVE Market Analyzer")
+root.configure(bg='#2e2e2e')
+
+style = ttk.Style()
+style.theme_use('clam')
+style.configure("TCombobox", fieldbackground="#3e3e3e", background="#3e3e3e", foreground="white")
+style.configure("TButton", background="#4e4e4e", foreground="white")
+style.configure("TCheckbutton", background="#2e2e2e", foreground="white")
+style.configure("TLabel", background="#2e2e2e", foreground="white")
+style.configure("TEntry", fieldbackground="#3e3e3e", foreground="white")
+
+main_frame = ttk.Frame(root)
+main_frame.pack(fill=tk.BOTH, expand=1, padx=10, pady=10)
+
+# Télécharger et charger les items au démarrage
+download_fuzzwork_types()
+ITEMS, NAME_TO_ID = load_items()
+
+# Item et région (Combobox avec recherche par nom)
+ttk.Label(main_frame, text="Item :").grid(row=0, column=0, pady=5)
+item_var = tk.StringVar(value="Tritanium")  # Par défaut : Tritanium
+item_combo = ttk.Combobox(main_frame, textvariable=item_var, values=sorted(NAME_TO_ID.keys()), width=50)
+item_combo.grid(row=0, column=1, pady=5)
+item_combo.config(postcommand=lambda: item_combo.configure(values=[name for name in sorted(NAME_TO_ID.keys()) 
+                                                                  if item_var.get().lower() in name.lower()]))
+
+ttk.Label(main_frame, text="Région :").grid(row=1, column=0, pady=5)
+region_var = tk.StringVar(value="10000002")
+ttk.Combobox(main_frame, textvariable=region_var, values=[f"{k} - {v}" for k, v in REGIONS.items()], 
+             state="readonly").grid(row=1, column=1, pady=5)
+
+# Timeframe
+ttk.Label(main_frame, text="Timeframe :").grid(row=2, column=0, pady=5)
+timeframe_var = tk.StringVar(value="Daily")
+ttk.Combobox(main_frame, textvariable=timeframe_var, values=["Daily", "Weekly"], 
+             state="readonly").grid(row=2, column=1, pady=5)
+
+# Indicateurs
+ind_frame = ttk.Frame(main_frame)
+ind_frame.grid(row=3, column=0, columnspan=2, pady=10)
+indicators = {}
+checks = {}
+entries = {}
+for i, ind in enumerate(["MA", "EMA", "TEMA", "RSI"]):
+    checks[ind] = tk.BooleanVar()
+    ttk.Checkbutton(ind_frame, text=ind, variable=checks[ind]).grid(row=i, column=0)
+    entries[ind] = ttk.Entry(ind_frame, width=5)
+    entries[ind].insert(0, "14")
+    entries[ind].grid(row=i, column=1)
+
+# ATR Stop Loss
+atr_frame = ttk.Frame(main_frame)
+atr_frame.grid(row=4, column=0, columnspan=2, pady=10)
+atr_check = tk.BooleanVar()
+ttk.Checkbutton(atr_frame, text="ATR Stop Loss", variable=atr_check).grid(row=0, column=0)
+ttk.Label(atr_frame, text="Length:").grid(row=0, column=1)
+atr_length = ttk.Entry(atr_frame, width=5)
+atr_length.insert(0, "14")
+atr_length.grid(row=0, column=2)
+ttk.Label(atr_frame, text="Smoothing:").grid(row=0, column=3)
+atr_smoothing = tk.StringVar(value="RMA")
+ttk.Combobox(atr_frame, textvariable=atr_smoothing, values=["RMA", "SMA", "EMA", "WMA"], 
+             state="readonly").grid(row=0, column=4)
+ttk.Label(atr_frame, text="Multiplier:").grid(row=0, column=5)
+atr_mult = ttk.Entry(atr_frame, width=5)
+atr_mult.insert(0, "1.5")
+atr_mult.grid(row=0, column=6)
+
+# Options
+opt_frame = ttk.Frame(main_frame)
+opt_frame.grid(row=5, column=0, columnspan=2, pady=10)
+log_var = tk.BooleanVar()
+ttk.Checkbutton(opt_frame, text="Échelle log", variable=log_var).pack(side=tk.LEFT)
+
+# Bouton et logique
+def generate():
+    item_name = item_var.get()
+    type_id = NAME_TO_ID.get(item_name)  # Récupérer l'ID à partir du nom
+    if not type_id:
+        messagebox.showerror("Erreur", "Item non trouvé !")
+        return
+    region_id = int(region_var.get().split(" - ")[0])
+    timeframe = timeframe_var.get()
+    inds = {k: int(entries[k].get()) for k, v in checks.items() if v.get()}
+    atr_params = (int(atr_length.get()), atr_smoothing.get(), float(atr_mult.get())) if atr_check.get() else None
+    
+    threading.Thread(target=fetch_market_data, args=(type_id, region_id, 1)).start()
+    threading.Thread(target=fetch_order_book, args=(type_id, region_id, 2)).start()
+    root.after(100, check_queue)
+
+def check_queue():
+    market_data = None
+    order_book = None
+    
+    try:
+        while True:
+            thread_id, data = data_queue.get_nowait()
+            if isinstance(data, str):
+                messagebox.showerror("Erreur", data)
+            elif thread_id == 1:
+                market_data = data
+            elif thread_id == 2:
+                order_book = data
+    except queue.Empty:
+        if market_data:
+            item_name = item_var.get()
+            type_id = NAME_TO_ID.get(item_name)
+            df = process_data(market_data, timeframe_var.get(), 
+                           {k: int(entries[k].get()) for k, v in checks.items() if v.get()}, 
+                           (int(atr_length.get()), atr_smoothing.get(), float(atr_mult.get())) if atr_check.get() else None)
+            plot_chart(df, order_book, type_id, 
+                      int(region_var.get().split(" - ")[0]), timeframe_var.get(), 
+                      {k: int(entries[k].get()) for k, v in checks.items() if v.get()}, 
+                      atr_params if atr_check.get() else None, log_var.get(), root, ITEMS)
+        else:
+            root.after(100, check_queue)
+
+ttk.Button(main_frame, text="Générer", command=generate).grid(row=6, column=0, columnspan=2, pady=10)
+
+root.mainloop()
